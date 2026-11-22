@@ -59,9 +59,11 @@ def run_for(desc, values, files):
         ema = 0.0 if ema in ("", "Off") else 0.98 if ema.lower().startswith("short") else float(ema)
     except ValueError:
         ema = 0.0
-    lokr = "lokr" in desc.network_types and str(values.get("NETWORK_TYPE", "")).startswith("LoKR")
+    selected = str(values.get("NETWORK_TYPE", "")).lower()
+    lokr = "lokr" in desc.network_types and selected.startswith("lokr")
+    dora = "dora" in desc.network_types and selected.startswith("dora")
     adapter = desc.training_adapter and values.get("FAMILY_TRAINING_ADAPTER", True)
-    return {"dit_path": dit, "network_type": "lokr" if lokr else "lora",
+    return {"dit_path": dit, "network_type": "lokr" if lokr else "dora" if dora else "lora",
             "network_dim": int(values.get("NETWORK_DIM") or 16), "lokr_factor": int(values.get("LOKR_FACTOR") or 8),
             "optimizer_type": str(values.get("OPTIMIZER_TYPE") or "").strip(),
             "training_adapter": (files or {}).get(desc.training_adapter, "") if adapter else "",

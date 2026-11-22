@@ -28,7 +28,7 @@ MEGAPIXELS = ("0.25", "0.37", "0.5", "0.75", "1.0", "1.05", "1.5", "2.0", "2.4",
 SWAP = ("Auto (detect from GPU)", "0  (No swap — 16GB fp8 / 24GB bf16)", "4  (Light — 14GB fp8 / 20GB bf16)",
         "8  (Moderate — 12GB fp8 / 16GB bf16)", "12 (Aggressive — 10GB fp8 / 12GB bf16)", "16 (Max — 8GB fp8 / 10GB bf16)",
         "1", "2", "3", "5", "6", "7", "9", "10", "11", "13", "14", "15")        # the desktop's Blocks Swap list
-NETWORK_TYPES = {"lora": "LoRA (standard)", "lokr": "LoKR (Kronecker)"}
+NETWORK_TYPES = {"lora": "LoRA (standard)", "lokr": "LoKR (Kronecker)", "dora": "DoRA (weight-decomposed)"}
 EMA = ("Off", "0.98 (recommended)", "0.99 (stronger)", "0.995 (long runs only)")
 EMA_SHORT = "Short run (window = ¼ of the run)"
 EMA_HINT = ("Saves and previews a running average of the LoRA instead of its latest step: smoother, less overbaked. "
@@ -374,7 +374,7 @@ def form(desc):
     ]
     if len(desc.network_types) > 1:
         params += [_row("NETWORK_TYPE", "Network Type", "choice",
-                        desc.network_hint or "LoKR: potentially higher quality · LoRA: ~20% faster training",
+                        desc.network_hint or "DoRA: weight-decomposed adaptation · LoKR: Kronecker · LoRA: standard",
                         [NETWORK_TYPES.get(t, t) for t in desc.network_types]),
                    _row("LOKR_FACTOR", "LoKR Factor", hint="8 is the sweet spot · 4 = four times the parameters: "
                         "stronger, a bigger file, and ~5 GB more VRAM with adamw (use adamw8bit) · above 8: just use LoRA")]

@@ -2173,8 +2173,8 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                             license=metadata_license, tags=metadata_tags, trigger_phrase=metadata_trigger_phrase,
                             thumbnail=thumbnail_data_uri(thumb))
         md.update({"ss_network_module": f"fizgig.families ({desc.key}, {network_type})",
-                   "ss_network_dim": str(network_dim if network_type == "lora" else lokr_factor),
-                   "ss_network_alpha": str(network_alpha if network_type == "lora" else 1.0),
+                   "ss_network_dim": str(network_dim if network_type in ("lora", "dora") else lokr_factor),
+                   "ss_network_alpha": str(network_alpha if network_type in ("lora", "dora") else 1.0),
                    **({"ss_lokr_factor": str(lokr_factor)} if network_type == "lokr" else {}),
                    "ss_architecture": arch, "ss_epoch": str(epoch),
                    "ss_optimizer": opt_label, "ss_learning_rate": f"{learning_rate:g}",
@@ -3389,7 +3389,7 @@ def setup_parser():
     p.add_argument("--blocks_to_swap", type=int, default=0,
                    help="blocks streamed between CPU and GPU (not with nf4); -1 = as few as fit free VRAM")
     p.add_argument("--network_dim", type=int, default=32)
-    p.add_argument("--network_type", default="lora", choices=("lora", "lokr"))
+    p.add_argument("--network_type", default="lora", choices=("lora", "lokr", "dora"))
     p.add_argument("--preview_lora", default=None,
                    help="a LoRA on previews of the training model only, never in training (MOSS-Image's SFT look "
                         "LoRA); a file not there yet is picked up at a later preview")

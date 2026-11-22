@@ -79,6 +79,69 @@ class LoHa(nn.Module):
         return x @ w.to(x.dtype).transpose(-1, -2)
 
 
+def _dora_weight_tensor(weight):
+    """Return a floating-point view of ordinary or supported quantized Linear weights."""
+    if hasattr(weight, "dequantize"):
+        try:
+            weight = weight.dequantize()
+        except Exception:
+            pass
+    return weight
+
+
+class DoRAAdapter(nn.Module):
+    """DoRA for Linear layers. The base weight stays frozen; only A, B and the magnitude vector train.
+
+    The row-wise norm is detached, as in the PEFT/AI-Toolkit formulation. This avoids retaining a graph through
+    the frozen base matrix. Convolutions are deliberately not supported.
+    """
+    def __init__(self, in_features, out_features, rank, base_weight, A=None, B=None, magnitude=None,
+                 trainable=False, dtype=torch.float32):
+        super().__init__()
+        self.down = LoRAFactor(in_features, rank, bias=False)
+        self.up = LoRAFactor(rank, out_features, bias=False)
+        if A is not None:
+            self.down.weight.data.copy_(A)
+            self.up.weight.data.copy_(B)
+        else:
+            nn.init.kaiming_uniform_(self.down.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.up.weight)
+        dev = base_weight.device
+        if magnitude is None:
+            magnitude = _dora_weight_tensor(base_weight).detach().float().norm(dim=1)
+        self.magnitude = nn.Parameter(magnitude.detach().to(device=dev, dtype=dtype).clone(),
+                                      requires_grad=trainable)
+        self.down.to(dev, dtype).requires_grad_(trainable)
+        self.up.to(dev, dtype).requires_grad_(trainable)
+
+    def _scale(self, base_weight, strength):
+        # The norm is a non-differentiable normalization term; gradients flow through magnitude and the low-rank path.
+        with torch.no_grad():
+            w = _dora_weight_tensor(base_weight).detach().to(device=self.down.weight.device, dtype=torch.float32)
+            delta = self.up.weight.detach().float() @ self.down.weight.detach().float()
+            norm = (w + float(strength) * delta).norm(dim=1).clamp_min(1e-12)
+        return self.magnitude.float() / norm
+
+    def forward_delta(self, x, base_weight, strength=1.0):
+        dtype = x.dtype
+        a, b = self.down.weight.to(dtype), self.up.weight.to(dtype)
+        low_rank = torch.nn.functional.linear(torch.nn.functional.linear(x, a), b)
+        base_linear = torch.nn.functional.linear(x, _dora_weight_tensor(base_weight).to(device=x.device, dtype=dtype))
+        scale = self._scale(base_weight, strength).to(device=x.device, dtype=dtype)
+        shape = (1,) * (x.ndim - 1) + (scale.numel(),)
+        scale = scale.view(shape)
+        return (scale - 1) * base_linear + scale * (float(strength) * low_rank)
+
+    def delta(self, base_weight, strength=1.0):
+        """Dense effective weight delta, used only when baking/combining adapters."""
+        with torch.no_grad():
+            w = base_weight.detach().float()
+            d = self.up.weight.detach().float() @ self.down.weight.detach().float()
+            norm = (w + float(strength) * d).norm(dim=1).clamp_min(1e-12)
+            scale = self.magnitude.detach().float() / norm
+            return scale[:, None] * (w + float(strength) * d) - w
+
+
 class BlockMeter:
     """Block activity for one render (Repair Studio, a family with block_activity): per block, per position along
     the sequence, how hard the adapters push the block's output - ||sum of adapter terms|| / ||base output||,
@@ -162,6 +225,15 @@ class LoRALinear(nn.Module):
         self.adapters[name] = nn.Sequential(a, b)
         self.scales[name] = alpha / rank * strength
 
+    def add_dora(self, name, rank, trainable, A=None, B=None, magnitude=None, scale=1.0,
+                 trainable_dtype=torch.float32):
+        ad = DoRAAdapter(self.base.in_features, self.base.out_features, rank, self.base.weight, A, B, magnitude,
+                         trainable, trainable_dtype if trainable else torch.bfloat16)
+        dev = getattr(self, "home", None) or self._base_device()
+        ad.to(dev)
+        self.adapters[name] = ad
+        self.scales[name] = scale
+
     def add_lokr(self, name, trainable, factor=8, w1=None, w2=None, scale=1.0, trainable_dtype=torch.float32):
         ad = LoKR(self.base.in_features, self.base.out_features, factor, w1, w2)
         dev = getattr(self, "home", None) or self._base_device()
@@ -184,6 +256,9 @@ class LoRALinear(nn.Module):
         for n, ad in self.adapters.items():
             s = self.scales.get(n, 0.0)
             if s:
+                if isinstance(ad, DoRAAdapter):
+                    out = out + ad.forward_delta(x, self.base.weight, s).to(out.dtype)
+                    continue
                 if isinstance(ad, (LoKR, LoHa)):
                     out = out + (s * ad(x)).to(out.dtype)
                     continue
@@ -208,7 +283,10 @@ class LoRALinear(nn.Module):
             s = self.scales.get(n, 0.0)
             if not s:
                 continue
-            if isinstance(ad, (LoKR, LoHa)):
+            if isinstance(ad, DoRAAdapter):
+                term = ad.forward_delta(x, self.base.weight, s).to(out.dtype)
+                out = out + term
+            elif isinstance(ad, (LoKR, LoHa)):
                 term = (s * ad(x)).to(out.dtype)
                 out = out + term
             else:
@@ -338,6 +416,8 @@ class FamilyLoRA:
             if blocks is None or self.driver.block_of(full) in blocks:
                 if kind == "lokr":
                     w.add_lokr(TRAINABLE, True, factor, trainable_dtype=tdt)
+                elif kind == "dora":
+                    w.add_dora(TRAINABLE, rank, True, scale=alpha / rank, trainable_dtype=tdt)
                 else:
                     w.add(TRAINABLE, rank, alpha, True, trainable_dtype=tdt)
         self.rank, self.alpha, self.kind, self.factor = rank, alpha, kind, factor
@@ -431,7 +511,11 @@ class FamilyLoRA:
                     if fm is not None:
                         out[fm] = ("lora", A, B.chunk(n, dim=0)[pt], scale)
                 continue
-            out[full] = ("lora", A, B, scale)
+            magnitude = sd.get(f"{stem}.dora_scale", sd.get(f"{stem}.lora_magnitude_vector"))
+            if magnitude is not None:
+                out[full] = ("dora", (A, B, magnitude), None, scale)
+            else:
+                out[full] = ("lora", A, B, scale)
         return out
 
     # ---- frozen adapters ------------------------------------------------------------------------
@@ -456,6 +540,11 @@ class FamilyLoRA:
                 if P.shape[0] * Q.shape[0] != w.base.out_features or P.shape[1] * Q.shape[1] != w.base.in_features:
                     continue
                 w.add_lokr(name, False, w1=P, w2=Q)
+            elif kind == "dora":
+                A, B, magnitude = P
+                if A.shape[1] != w.base.in_features or B.shape[0] != w.base.out_features or magnitude.numel() != w.base.out_features:
+                    continue
+                w.add_dora(name, A.shape[0], False, A, B, magnitude, scale=scale)
             else:
                 if P.shape[1] != w.base.in_features or Q.shape[0] != w.base.out_features:
                     continue
@@ -566,18 +655,32 @@ class FamilyLoRA:
         st = self._frozen[name]
         new = self.read_file(path)
 
-        def params(full):
+        def compatible(full, entry):
+            kind, P, Q, _scale = entry
             ad = self.wrapped[full].adapters[name]
-            return (ad.lokr_w1, ad.lokr_w2) if isinstance(ad, LoKR) else (ad[0].weight, ad[1].weight)
-        same = set(new) == set(st["alpha_rank"]) and not any(
-            new[f][0] == "loha" or isinstance(self.wrapped[f].adapters[name], LoHa) for f in new) and all(
-            (new[f][0] == "lokr") == isinstance(self.wrapped[f].adapters[name], LoKR)
-            and params(f)[0].shape == new[f][1].shape and params(f)[1].shape == new[f][2].shape for f in new)
+            if kind == "dora":
+                return (isinstance(ad, DoRAAdapter) and P[0].shape == ad.down.weight.shape
+                        and P[1].shape == ad.up.weight.shape and P[2].shape == ad.magnitude.shape)
+            if kind == "lokr":
+                return (isinstance(ad, LoKR) and P.shape == ad.lokr_w1.shape and Q.shape == ad.lokr_w2.shape)
+            if kind == "loha" or isinstance(ad, (LoHa, LoKR, DoRAAdapter)):
+                return False
+            return isinstance(ad, nn.Sequential) and P.shape == ad[0].weight.shape and Q.shape == ad[1].weight.shape
+
+        same = set(new) == set(st["alpha_rank"]) and all(compatible(f, new[f]) for f in new)
         if same:
-            for full, (_kind, P, Q, scale) in new.items():
-                a, b = params(full)
-                a.copy_(P.to(a.dtype))
-                b.copy_(Q.to(b.dtype))
+            for full, (kind, P, Q, scale) in new.items():
+                ad = self.wrapped[full].adapters[name]
+                if kind == "dora":
+                    ad.down.weight.copy_(P[0].to(ad.down.weight.dtype))
+                    ad.up.weight.copy_(P[1].to(ad.up.weight.dtype))
+                    ad.magnitude.copy_(P[2].to(ad.magnitude.dtype))
+                elif kind == "lokr":
+                    ad.lokr_w1.copy_(P.to(ad.lokr_w1.dtype))
+                    ad.lokr_w2.copy_(Q.to(ad.lokr_w2.dtype))
+                else:
+                    ad[0].weight.copy_(P.to(ad[0].weight.dtype))
+                    ad[1].weight.copy_(Q.to(ad[1].weight.dtype))
                 st["alpha_rank"][full] = scale
             st["path"] = path
             self._apply(name)
@@ -630,12 +733,13 @@ class FamilyLoRA:
             As, Bs = [], []
             for n, sc in live:
                 ad = w.adapters[n]
-                if isinstance(ad, (LoKR, LoHa)):   # Kronecker / Hadamard delta: SVD to a rank <= 64 LoRA
-                    U, S, Vh = torch.linalg.svd(ad.delta(), full_matrices=False)
+                if isinstance(ad, (LoKR, LoHa, DoRAAdapter)):   # non-LoRA delta: SVD to a rank <= 64 LoRA
+                    delta = ad.delta(w.base.weight, sc) if isinstance(ad, DoRAAdapter) else ad.delta()
+                    U, S, Vh = torch.linalg.svd(delta, full_matrices=False)
                     k = min(64, S.numel())
                     root = S[:k].sqrt()
                     As.append(root[:, None] * Vh[:k])
-                    Bs.append(U[:, :k] * root * sc)
+                    Bs.append(U[:, :k] * root * (1.0 if isinstance(ad, DoRAAdapter) else sc))
                     continue
                 a, b = ad
                 As.append(a.weight.float())
@@ -652,7 +756,15 @@ class FamilyLoRA:
     def state_dict(self, dtype=torch.bfloat16):
         sd = {}
         for full, w in self.wrapped.items():
-            if TRAINABLE in w.adapters and isinstance(w.adapters[TRAINABLE], LoKR):
+            if TRAINABLE in w.adapters and isinstance(w.adapters[TRAINABLE], DoRAAdapter):
+                ad = w.adapters[TRAINABLE]
+                stem = self._stem(full)
+                ka, kb, kal = self._keys(full)
+                sd[ka] = ad.down.weight.detach().to("cpu", dtype).contiguous()
+                sd[kb] = ad.up.weight.detach().to("cpu", dtype).contiguous()
+                sd[f"{stem}.dora_scale"] = ad.magnitude.detach().to("cpu", dtype).contiguous()
+                sd[kal] = torch.tensor(float(self.alpha))
+            elif TRAINABLE in w.adapters and isinstance(w.adapters[TRAINABLE], LoKR):
                 ad = w.adapters[TRAINABLE]
                 stem = self._stem(full, lokr=True)
                 sd[f"{stem}.lokr_w1"] = ad.lokr_w1.detach().to("cpu", dtype).contiguous()
@@ -685,6 +797,16 @@ class FamilyLoRA:
             if TRAINABLE not in w.adapters:
                 continue                # frozen-only wraps (training adapter, speed LoRA extras) hold nothing to load
             ad = w.adapters[TRAINABLE]
+            if isinstance(ad, DoRAAdapter):
+                stem = self._stem(full)
+                ka, kb, _ = self._keys(full)
+                magnitude = sd.get(f"{stem}.dora_scale", sd.get(f"{stem}.lora_magnitude_vector"))
+                if ka in sd and magnitude is not None:
+                    ad.down.weight.copy_(sd[ka].to(ad.down.weight.dtype))
+                    ad.up.weight.copy_(sd[kb].to(ad.up.weight.dtype))
+                    ad.magnitude.copy_(magnitude.to(ad.magnitude.dtype))
+                    n += 1
+                continue
             if isinstance(ad, LoKR):
                 stem = self._stem(full, lokr=True)
                 if f"{stem}.lokr_w1" in sd:
