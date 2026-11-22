@@ -589,7 +589,7 @@ class FamilyDescription:
     optimizer_families: tuple = ()
     # Automagic v3's sign window for this family when Optimizer Args doesn't set polarity_history (0 = its default)
     automagic_sign_window: int = 0
-    network_types: tuple = ("lora",)
+    network_types: tuple = ("lora", "dora")
     # Adaptive LR also treats a grad-clip ratio over 50% of an epoch's steps as a stability signal (Klein's rule,
     # training/adaptive_lr.AdaptiveLR clip_signal)
     adaptive_lr_clip_signal: bool = False
