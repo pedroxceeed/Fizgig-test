@@ -407,7 +407,7 @@ class FamilyLoRA:
                 if kind == "lokr":
                     w.add_lokr(TRAINABLE, True, factor, trainable_dtype=tdt)
                 elif kind == "dora":
-                    w.add_dora(TRAINABLE, rank, True, trainable_dtype=tdt)
+                    w.add_dora(TRAINABLE, rank, True, scale=alpha / rank, trainable_dtype=tdt)
                 else:
                     w.add(TRAINABLE, rank, alpha, True, trainable_dtype=tdt)
         self.rank, self.alpha, self.kind, self.factor = rank, alpha, kind, factor
@@ -710,7 +710,7 @@ class FamilyLoRA:
             for n, sc in live:
                 ad = w.adapters[n]
                 if isinstance(ad, (LoKR, LoHa, DoRAAdapter)):   # non-LoRA delta: SVD to a rank <= 64 LoRA
-                    delta = ad.delta(w.base.weight, s1) if isinstance(ad, DoRAAdapter) else ad.delta()
+                    delta = ad.delta(w.base.weight, sc) if isinstance(ad, DoRAAdapter) else ad.delta()
                     U, S, Vh = torch.linalg.svd(delta, full_matrices=False)
                     k = min(64, S.numel())
                     root = S[:k].sqrt()
