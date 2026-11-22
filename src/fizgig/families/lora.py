@@ -729,7 +729,7 @@ class FamilyLoRA:
                     k = min(64, S.numel())
                     root = S[:k].sqrt()
                     As.append(root[:, None] * Vh[:k])
-                    Bs.append(U[:, :k] * root * sc)
+                    Bs.append(U[:, :k] * root * (1.0 if isinstance(ad, DoRAAdapter) else sc))
                     continue
                 a, b = ad
                 As.append(a.weight.float())
