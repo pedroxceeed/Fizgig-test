@@ -79,6 +79,16 @@ class LoHa(nn.Module):
         return x @ w.to(x.dtype).transpose(-1, -2)
 
 
+def _dora_weight_tensor(weight):
+    """Return a floating-point view of ordinary or supported quantized Linear weights."""
+    if hasattr(weight, "dequantize"):
+        try:
+            weight = weight.dequantize()
+        except Exception:
+            pass
+    return weight
+
+
 class DoRAAdapter(nn.Module):
     """DoRA for Linear layers. The base weight stays frozen; only A, B and the magnitude vector train.
 
@@ -98,7 +108,7 @@ class DoRAAdapter(nn.Module):
             nn.init.zeros_(self.up.weight)
         dev = base_weight.device
         if magnitude is None:
-            magnitude = base_weight.detach().float().norm(dim=1)
+            magnitude = _dora_weight_tensor(base_weight).detach().float().norm(dim=1)
         self.magnitude = nn.Parameter(magnitude.detach().to(device=dev, dtype=dtype).clone(),
                                       requires_grad=trainable)
         self.down.to(dev, dtype).requires_grad_(trainable)
@@ -107,7 +117,7 @@ class DoRAAdapter(nn.Module):
     def _scale(self, base_weight, strength):
         # The norm is a non-differentiable normalization term; gradients flow through magnitude and the low-rank path.
         with torch.no_grad():
-            w = base_weight.detach().to(device=self.down.weight.device, dtype=torch.float32)
+            w = _dora_weight_tensor(base_weight).detach().to(device=self.down.weight.device, dtype=torch.float32)
             delta = self.up.weight.detach().float() @ self.down.weight.detach().float()
             norm = (w + float(strength) * delta).norm(dim=1).clamp_min(1e-12)
         return self.magnitude.float() / norm
@@ -116,7 +126,7 @@ class DoRAAdapter(nn.Module):
         dtype = x.dtype
         a, b = self.down.weight.to(dtype), self.up.weight.to(dtype)
         low_rank = torch.nn.functional.linear(torch.nn.functional.linear(x, a), b)
-        base_linear = torch.nn.functional.linear(x, base_weight.to(device=x.device, dtype=dtype))
+        base_linear = torch.nn.functional.linear(x, _dora_weight_tensor(base_weight).to(device=x.device, dtype=dtype))
         scale = self._scale(base_weight, strength).to(device=x.device, dtype=dtype)
         shape = (1,) * (x.ndim - 1) + (scale.numel(),)
         scale = scale.view(shape)
