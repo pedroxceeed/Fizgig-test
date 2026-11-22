@@ -645,18 +645,32 @@ class FamilyLoRA:
         st = self._frozen[name]
         new = self.read_file(path)
 
-        def params(full):
+        def compatible(full, entry):
+            kind, P, Q, _scale = entry
             ad = self.wrapped[full].adapters[name]
-            return (ad.lokr_w1, ad.lokr_w2) if isinstance(ad, LoKR) else (ad[0].weight, ad[1].weight)
-        same = set(new) == set(st["alpha_rank"]) and not any(
-            new[f][0] == "loha" or isinstance(self.wrapped[f].adapters[name], LoHa) for f in new) and all(
-            (new[f][0] == "lokr") == isinstance(self.wrapped[f].adapters[name], LoKR)
-            and params(f)[0].shape == new[f][1].shape and params(f)[1].shape == new[f][2].shape for f in new)
+            if kind == "dora":
+                return (isinstance(ad, DoRAAdapter) and P[0].shape == ad.down.weight.shape
+                        and P[1].shape == ad.up.weight.shape and P[2].shape == ad.magnitude.shape)
+            if kind == "lokr":
+                return (isinstance(ad, LoKR) and P.shape == ad.lokr_w1.shape and Q.shape == ad.lokr_w2.shape)
+            if kind == "loha" or isinstance(ad, (LoHa, LoKR, DoRAAdapter)):
+                return False
+            return isinstance(ad, nn.Sequential) and P.shape == ad[0].weight.shape and Q.shape == ad[1].weight.shape
+
+        same = set(new) == set(st["alpha_rank"]) and all(compatible(f, new[f]) for f in new)
         if same:
-            for full, (_kind, P, Q, scale) in new.items():
-                a, b = params(full)
-                a.copy_(P.to(a.dtype))
-                b.copy_(Q.to(b.dtype))
+            for full, (kind, P, Q, scale) in new.items():
+                ad = self.wrapped[full].adapters[name]
+                if kind == "dora":
+                    ad.down.weight.copy_(P[0].to(ad.down.weight.dtype))
+                    ad.up.weight.copy_(P[1].to(ad.up.weight.dtype))
+                    ad.magnitude.copy_(P[2].to(ad.magnitude.dtype))
+                elif kind == "lokr":
+                    ad.lokr_w1.copy_(P.to(ad.lokr_w1.dtype))
+                    ad.lokr_w2.copy_(Q.to(ad.lokr_w2.dtype))
+                else:
+                    ad[0].weight.copy_(P.to(ad[0].weight.dtype))
+                    ad[1].weight.copy_(Q.to(ad[1].weight.dtype))
                 st["alpha_rank"][full] = scale
             st["path"] = path
             self._apply(name)
